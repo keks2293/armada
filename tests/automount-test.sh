@@ -11,6 +11,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/system_files/usr/lib/hwsupport/steamos-automount.sh"
 UDEV="$ROOT/system_files/usr/lib/udev/rules.d/99-steamos-automount.rules"
 BASE_PKGS="$ROOT/build_files/10-base-packages.sh"
+AUTOMOUNT_CONF="$ROOT/system_files/etc/default/armada-automount"
 
 fail() {
     printf '%s\n' "$1" >&2
@@ -19,6 +20,7 @@ fail() {
 
 [[ -f "$SCRIPT" ]] || fail "missing automount helper: $SCRIPT"
 [[ -f "$UDEV" ]] || fail "missing udev rule: $UDEV"
+[[ -f "$AUTOMOUNT_CONF" ]] || fail "missing /etc/default/armada-automount skeleton: $AUTOMOUNT_CONF"
 
 # The standalone Python daemon and its session drop-ins are gone; the udev
 # based helper needs no session plumbing because it runs outside sessions.
@@ -50,6 +52,32 @@ done
 grep -Fq 'UDISKS2_ALLOW' "$SCRIPT" || fail "missing udisks2 mount-option allowlist"
 grep -Fq 'mount_options.conf' "$SCRIPT" || fail "missing mount_options.conf handling"
 grep -Fq 'FSCKTOOL' "$SCRIPT" || fail "missing per-filesystem fsck handling"
+
+# Per-system knobs, sourced from a root-owned /etc/default file like
+# Bazzite's steamos-btrfs: mount options per fs and the btrfs subvolume.
+grep -Fq '/etc/default/armada-automount' "$SCRIPT" || fail "missing /etc/default/armada-automount sourcing"
+grep -Fq 'ARMADA_AUTOMOUNT_EXFAT_MOUNT_OPTS' "$SCRIPT" || fail "missing mount-option override knob"
+grep -Fq 'ARMADA_AUTOMOUNT_BTRFS_SUBVOL' "$SCRIPT" || fail "missing btrfs subvolume override knob"
+grep -Fq 'ARMADA_AUTOMOUNT_BTRFS_SUBVOL' "$AUTOMOUNT_CONF" \
+    || fail "missing btrfs subvolume knob in config skeleton"
+
+# NTFS must not create Windows-invalid file names (Proton crash source).
+grep -Fq 'windows_names' "$SCRIPT" || fail "missing windows_names on NTFS mounts"
+
+# btrfs niceties: mount the main subvolume, give Steam NOCOW downloads.
+grep -Fq 'subvol=' "$SCRIPT" || fail "missing btrfs subvolume mount support"
+grep -Fq 'btrfs subvolume create' "$SCRIPT" || fail "missing btrfs NOCOW subvolume creation"
+grep -Fq 'chattr +C' "$SCRIPT" || fail "missing +C on btrfs download subvolumes"
+grep -Fq 'rm -rf' "$SCRIPT" || fail "missing Bazzite-style discard of leftover download dirs on btrfs"
+grep -Fq 'steamapps' "$SCRIPT" || fail "missing steamapps special-casing"
+
+# compatdata bind is opt-in and off by default (same tradeoff as Bazzite).
+grep -Fq 'ARMADA_AUTOMOUNT_COMPATDATA_BIND_MOUNT:-0' "$SCRIPT" \
+    || fail "missing compatdata bind knob (default 0)"
+grep -Fq 'mount --rbind' "$SCRIPT" || fail "missing compatdata bind mount"
+grep -Fq 'umount -l -R' "$SCRIPT" || fail "missing lazy teardown of compatdata bind"
+grep -Fq 'ARMADA_AUTOMOUNT_COMPATDATA_BIND_MOUNT' "$AUTOMOUNT_CONF" \
+    || fail "missing compatdata knob in config skeleton"
 
 # Removable-only: never grab the OS disk, internal eMMC or internal SATA.
 grep -Fq 'armada_is_sd_storage_device' "$SCRIPT" || fail "missing SD device gate"

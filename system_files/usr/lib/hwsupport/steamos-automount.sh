@@ -9,6 +9,13 @@ fi
 
 . /usr/lib/hwsupport/common-functions
 
+# Optional per-system overrides (mount options per filesystem, btrfs mount
+# subvolume). Same idea as Bazzite's /etc/default/steamos-btrfs. The file is
+# root-owned on the image; nothing is sourced if it does not exist.
+if [[ -f /etc/default/armada-automount ]]; then
+    source /etc/default/armada-automount
+fi
+
 # Originally from https://serverfault.com/a/767079
 
 # This script is called from our systemd unit file to mount or unmount
@@ -107,30 +114,54 @@ do_mount()
     # any of these; FAT/NTFS need uid/gid so the files belong to the user.
     case "${ID_FS_TYPE}" in
         ext4)
-            OPTS="rw,noatime"
+            OPTS="${ARMADA_AUTOMOUNT_EXT4_MOUNT_OPTS:-rw,noatime}"
             FSCKTOOL="fsck.ext4"
             ;;
+        # f2fs support is kept for parity with Bazzite. The Armada kernel
+        # (7.2.3 as of writing) ships no f2fs module, so this branch is inert
+        # until the kernel gains it; harmless in the meantime.
         f2fs)
-            OPTS="rw,noatime"
+            OPTS="${ARMADA_AUTOMOUNT_F2FS_MOUNT_OPTS:-rw,noatime}"
             FSCKTOOL="fsck.f2fs"
             ;;
         btrfs)
             # btrfs is self-checking and must not be fsck'ed while active.
-            OPTS="rw,noatime"
+            # These defaults are plain rw,noatime (Bazzite adds lazytime and
+            # compress-force=zstd); both sides expose the same knobs via
+            # /etc/default/armada-automount.
+            OPTS="${ARMADA_AUTOMOUNT_BTRFS_MOUNT_OPTS:-rw,noatime}"
             FSCKTOOL=""
+            # Mount the main subvolume the card was laid out with, instead of
+            # showing the empty top-level that holds only subvolumes.
+            if command -v btrfs > /dev/null 2>&1; then
+                subvol="${ARMADA_AUTOMOUNT_BTRFS_SUBVOL-@}"
+                mount_point_tmp="/var/run/armada-automount-${DEVBASE}.tmp"
+                mkdir -p "${mount_point_tmp}"
+                if [[ -n "${subvol}" ]] && /bin/mount -t btrfs -o ro "${DEVICE}" "${mount_point_tmp}" 2>/dev/null; then
+                    if [[ -d "${mount_point_tmp}/${subvol}" ]] && \
+                        btrfs subvolume show "${mount_point_tmp}/${subvol}" &>/dev/null; then
+                        OPTS+=",subvol=${subvol}"
+                    fi
+                    /bin/umount -l "${mount_point_tmp}" 2>/dev/null || true
+                fi
+                rmdir "${mount_point_tmp}" 2>/dev/null || true
+            fi
             ;;
         vfat)
-            OPTS="rw,noatime,uid=${DECK_UID},gid=${DECK_GID},utf8=1,umask=000,flush"
+            OPTS="${ARMADA_AUTOMOUNT_VFAT_MOUNT_OPTS:-rw,noatime,uid=${DECK_UID},gid=${DECK_GID},utf8=1,umask=000,flush}"
             FSCKTOOL="fsck.vfat"
             UDISKS2_ALLOW='uid,gid,flush,utf8,shortname,umask,dmask,fmask,codepage,iocharset,usefree,showexec'
             ;;
         exfat)
-            OPTS="rw,noatime,uid=${DECK_UID},gid=${DECK_GID}"
+            OPTS="${ARMADA_AUTOMOUNT_EXFAT_MOUNT_OPTS:-rw,noatime,uid=${DECK_UID},gid=${DECK_GID}}"
             FSCKTOOL="fsck.exfat"
             UDISKS2_ALLOW='uid,gid,dmask,errors,fmask,iocharset,namecase,umask'
             ;;
+        # Unlike Bazzite we mount NTFS with the in-kernel ntfs3 driver (present
+        # in the Armada kernel) instead of remapping to userspace lowntfs-3g
+        # and registering the fstype in /etc/filesystems.
         ntfs)
-            OPTS="rw,noatime,uid=${DECK_UID},gid=${DECK_GID}"
+            OPTS="${ARMADA_AUTOMOUNT_NTFS_MOUNT_OPTS:-rw,noatime,uid=${DECK_UID},gid=${DECK_GID},windows_names}"
             FSCKTOOL="ntfsfix"
             UDISKS2_ALLOW='uid,gid,umask,dmask,fmask,locale,norecover,ignore_case,windows_names,nls,sparse,showmeta,prealloc'
             ;;
@@ -164,6 +195,9 @@ do_mount()
     # Try to repair the filesystem if it's known to have errors.
     # ret=0 means no errors, 1 means that errors were corrected.
     # In all other cases we try to mount the fs read-only and report an error.
+    # Unlike Bazzite's fsck."${ID_FS_TYPE}" -y (which would try the
+    # nonexistent fsck.btrfs) the tool is picked per filesystem above, and
+    # btrfs is never fsck'ed.
     ret=0
     if [[ -n "${FSCKTOOL}" ]] && command -v "${FSCKTOOL}" > /dev/null 2>&1; then
         if [[ "${FSCKTOOL}" == "ntfsfix" ]]; then
@@ -181,6 +215,9 @@ do_mount()
     fi
 
     # Ask udisks to auto-mount. This needs a version of udisks that supports the 'as-user' option.
+    # Unlike Bazzite we do not add a fstype s "$FSTYPE" variant here
+    # ('a{sv}' 4): they use it to remap NTFS to userspace lowntfs-3g, while we
+    # rely on the detected ID_FS_TYPE and the kernel ntfs3 driver.
     mount_point=$(make_dbus_udisks_call call 'data[0]' s         \
                                  "block_devices/${DEVBASE}"      \
                                  Filesystem Mount                \
@@ -192,6 +229,36 @@ do_mount()
     # Ensure that the armada user can write to the root directory
     if ! setpriv --clear-groups --reuid "${DECK_UID}" --regid "${DECK_GID}" test -w "${mount_point}"; then
         chmod 777 "${mount_point}" || true
+    fi
+
+    # Workaround for the Steam compression bug on btrfs: Steam rewrites its
+    # downloads in-place, which fights COW — and resumed leftovers would keep
+    # COW otherwise. Like Bazzite, force NOCOW subvolumes on every mount,
+    # discarding any plain leftover folder so downloads always run NOCOW.
+    if [[ "${ID_FS_TYPE}" == "btrfs" ]] && command -v btrfs > /dev/null 2>&1 && command -v chattr > /dev/null 2>&1; then
+        mkdir -p "${mount_point}"/steamapps
+        for d in "${mount_point}"/steamapps/{downloading,temp}; do
+            if ! btrfs subvolume show "${d}" &>/dev/null; then
+                rm -rf -- "${d}"
+                btrfs subvolume create "${d}" &>/dev/null || true
+                chattr +C "${d}" 2>/dev/null || true
+            fi
+            chown "${DECK_UID}:${DECK_GID}" "${d}" 2>/dev/null || true
+        done
+        chown "${DECK_UID}:${DECK_GID}" "${mount_point}"/steamapps 2>/dev/null || true
+    elif [[ "${ARMADA_AUTOMOUNT_COMPATDATA_BIND_MOUNT:-0}" == "1" ]] && \
+        [[ "${ID_FS_TYPE}" == "vfat" || "${ID_FS_TYPE}" == "exfat" || "${ID_FS_TYPE}" == "ntfs" ]]; then
+        # Bind mount the compatdata folder from the internal disk so Proton
+        # games on Windows-formatted drives get a prefix that supports
+        # symlinks and exec bits. Opt-in only: this breaks Steam's eject
+        # on the drive (same tradeoff as Bazzite, default there is 0 too).
+        deck_home="$(getent passwd "${DECK_USER}" | cut -d: -f6)"
+        mkdir -p "${mount_point}"/steamapps/compatdata
+        chown "${DECK_UID}:${DECK_GID}" "${mount_point}"/steamapps{,/compatdata}
+        mkdir -p "${deck_home}"/.local/share/Steam/steamapps/compatdata
+        chown "${DECK_UID}:${DECK_GID}" "${deck_home}"/.local{,/share{,/Steam{,/steamapps{,/compatdata}}}}
+        mount --rbind "${deck_home}"/.local/share/Steam/steamapps/compatdata \
+            "${mount_point}"/steamapps/compatdata
     fi
 
     # Create a symlink from /run/media to keep compatibility with apps
@@ -217,6 +284,11 @@ do_unmount()
 {
     local mount_point=$(findmnt -fno TARGET "${DEVICE}" || true)
     if [[ -n $mount_point ]]; then
+        # Release the compatdata bind mount (if any) before teardown; it is
+        # lazy because Steam may still hold the mount in its namespace.
+        if mountpoint -q "${mount_point}"/steamapps/compatdata; then
+            /bin/umount -l -R "${mount_point}"/steamapps/compatdata 2>/dev/null || true
+        fi
         # Remove symlink to the mount point that we're unmounting
         find /run/media -maxdepth 1 -xdev -type l -lname "${mount_point}" -exec rm -- {} \;
     else

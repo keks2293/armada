@@ -1,0 +1,24 @@
+# Optional per-system tweaks for removable-media automounting
+# (/usr/lib/hwsupport/steamos-automount.sh).
+#
+# This file is sourced by the automount helper when present. Uncomment a line
+# to override the built-in default. The defaults shown are the built-ins.
+#
+# Mount options per filesystem. Extra options are automatically allowed for
+# the udisks2 mount, so plain, filesystem-agnostic additions (e.g. nodiratime)
+# work as-is.
+# ARMADA_AUTOMOUNT_EXT4_MOUNT_OPTS="rw,noatime"
+# ARMADA_AUTOMOUNT_F2FS_MOUNT_OPTS="rw,noatime"
+# ARMADA_AUTOMOUNT_BTRFS_MOUNT_OPTS="rw,noatime"
+# ARMADA_AUTOMOUNT_VFAT_MOUNT_OPTS="rw,noatime,uid=1000,gid=1000,utf8=1,umask=000,flush"
+# ARMADA_AUTOMOUNT_EXFAT_MOUNT_OPTS="rw,noatime,uid=1000,gid=1000"
+# ARMADA_AUTOMOUNT_NTFS_MOUNT_OPTS="rw,noatime,uid=1000,gid=1000,windows_names"
+#
+# btrfs main subvolume to mount (default "@"). Empty to disable subvolume
+# mounting and show the top-level.
+# ARMADA_AUTOMOUNT_BTRFS_SUBVOL="@"
+#
+# Opt-in: bind mount the internal compatdata over steamapps/compatdata on
+# Windows-formatted (vfat/exfat/ntfs) drives so Proton games start from them.
+# Tradeoff: the Steam client can no longer eject the drive.
+# ARMADA_AUTOMOUNT_COMPATDATA_BIND_MOUNT="0"
