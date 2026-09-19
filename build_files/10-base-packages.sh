@@ -29,6 +29,7 @@ dnf5 -y install --setopt=install_weak_deps=False \
     polkit \
     upower \
     sudo \
+    udisks2 \
     rsync \
     curl \
     git \
