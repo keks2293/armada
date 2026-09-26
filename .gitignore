@@ -5,3 +5,6 @@ cosign.key
 __pycache__/
 *.pyc
 
+tests/rp6-vkd3d-sparse-test
+tests/cast_f32_spv.c
+tests/*.spv
