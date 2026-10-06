@@ -768,3 +768,11 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0505a-arm64-unaligned-atomics-cover-the-load128-store-exclusive.patch`
   source: armada
   upstream: local
+- `patches/0531-phy-qcom-qmp-combo-replay-shared-com-setup-after-sleep.patch`
+  source: armada
+  upstream: not submitted
+  notes: Fixes USB dying across s2idle on the RP6. With a DP alt mode display the DP sub-PHY keeps `qmp->init_count` over sleep, so `qmp_combo_com_init()` bumps the count and returns without touching the shared block while its USB3_PHY_GDSC has collapsed with CX; `qmp_combo_usb_power_on()` then polls `QPHY_PCS_STATUS` on an unprogrammed block, returns -110, dwc3-qcom resume fails and xhci reports a host system error, taking both USB buses down until reboot while DP keeps showing. Adds a system-sleep hook that marks the block stale and a register-only replay in `com_init()` (no regulator, reset or clock changes, so a live DP link is untouched), and carries the block's mode plus the usb/dp refcounts in the timeout message so the next failure is diagnosable from dmesg alone. Applies to a pristine v7.2.6 tree on its own; mainline carries no system-sleep ops for this PHY, so it is a candidate for linux-phy@ once confirmed on hardware.
+- `patches/0531a-phy-qcom-qmp-combo-stop-disabling-pipe-clock-it-does-not-own.patch`
+  source: armada
+  upstream: not submitted
+  notes: Second half of the same fix, must follow 0531 in `patches/series`: its hunk context expects the timeout `dev_err()` that 0531 rewrites, so applying it to a pristine tree fails. Drops `usb_power_on()`'s error-path `clk_disable_unprepare(qmp->pipe_clk)`, a clock owned by `qmp_combo_com_init()`/`qmp_combo_com_exit()`; when the DP sub-PHY holds the reference `com_exit()` correctly leaves it alone, so the extra disable fired on an already-off clock and produced the "gcc_usb3_prim_phy_pipe_clk already disabled/unprepared" warnings that hid the real failure. Mainline v7.2.6 still disables that clock, so this is a candidate for linux-phy@ alongside 0531.

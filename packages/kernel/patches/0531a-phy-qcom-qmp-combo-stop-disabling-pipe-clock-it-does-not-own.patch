@@ -1,0 +1,41 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] phy: qcom: qmp-combo: stop disabling the pipe clock it does not own
+
+Second half of the fix; applies on top of the companion patch
+0531-phy-qcom-qmp-combo-replay-shared-com-setup-after-sleep.patch.
+
+qmp_combo_usb_power_on() drops qmp->pipe_clk on its error path, but that
+clock is taken by qmp_combo_com_init() and given back by
+qmp_combo_com_exit(), which qmp_combo_usb_init() calls right after a
+failed power-on. When a second user - the DP sub-PHY - holds the
+init_count reference, com_exit() correctly leaves the clock alone, so
+power-on()'s extra disable fires on a clock that is already off:
+
+    gcc_usb3_prim_phy_pipe_clk already disabled
+    gcc_usb3_prim_phy_pipe_clk already unprepared
+
+and leaves the shared block with a stale pipe clock for the next attempt,
+hiding the real failure behind a pair of warnings. Drop the error path and
+let the caller's com_exit() own the teardown.
+
+Signed-off-by: Armada <noreply@armada.local>
+---
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -3940,15 +3940,10 @@
+ 			qmp->qmpphy_mode, qmp->com_powered);
+ 		dev_err(qmp->dev, "  qmp refs: usb_init=%u dp_init=%u\n",
+ 			qmp->usb_init_count, qmp->dp_init_count);
+-		goto err_disable_pipe_clk;
++		return ret;
+ 	}
+ 
+ 	return 0;
+-
+-err_disable_pipe_clk:
+-	clk_disable_unprepare(qmp->pipe_clk);
+-
+-	return ret;
+ }
+ 
+ static int qmp_combo_usb_power_off(struct phy *phy)

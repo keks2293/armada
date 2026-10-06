@@ -1,0 +1,234 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] phy: qcom: qmp-combo: replay shared COM block setup after system sleep
+
+The shared USB3/DP COM block can be kept referenced across system sleep by
+a second user while the USB sub-PHY is released: with a DP alt mode
+display attached the DP sub-PHY holds qmp->init_count, so
+qmp_combo_com_init() only bumps the reference count and returns without
+touching the hardware. The block's USB3_PHY_GDSC collapses with CX over
+s2idle all the same, taking the COM register state with it, and
+qmp_combo_usb_power_on() then starts the SerDes/PCS on a block that was
+never programmed: it polls QPHY_PCS_STATUS until PHY_INIT_COMPLETE_TIMEOUT,
+returns -110, dwc3-qcom_pm_resume() fails, xhci reports a host system
+error and both USB buses stay dead until reboot. The DP side survives
+because DRM never re-runs its init.
+
+Mark the block stale from a new system-sleep hook and replay the reset and
+register programming from qmp_combo_com_init() when a user other than the
+one that set the block up finds it that way. The replay only writes
+registers - no regulator voting, no reset pulse, no clock gating - so a DP
+link that is alive after resume is not disturbed, and it is skipped
+entirely whenever the block is known to be live.
+
+Carry the block's mode and the usb/dp reference counts in the timeout
+message too, so the next occurrence is diagnosable from dmesg alone.
+
+Signed-off-by: Armada <noreply@armada.local>
+---
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2294,6 +2294,8 @@
+ 
+ 	struct mutex phy_mutex;
+ 	int init_count;
++	/* the shared COM block is programmed and its clocks are on */
++	bool com_powered;
+ 	enum qmpphy_mode qmpphy_mode;
+ 
+ 	struct phy *usb_phy;
+@@ -3627,46 +3629,19 @@
+ 	return ret;
+ }
+ 
+-static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
++/*
++ * Program the shared COM block: reset overrides, the type-C port select and
++ * the PHY mode. Only registers are touched - regulators, resets and clocks
++ * are assumed to be up already - so it can be replayed on a block another
++ * user (typically the DP sub-PHY) set up, without disturbing that user.
++ */
++static void qmp_combo_com_program(struct qmp_combo *qmp)
+ {
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 	void __iomem *com = qmp->com;
+ 	void __iomem *pcs_aon = qmp->pcs_aon;
+-	int ret;
+ 	u32 val;
+ 
+-	if (!force && qmp->init_count++)
+-		return 0;
+-
+-	ret = regulator_bulk_enable(cfg->num_vregs, qmp->vregs);
+-	if (ret) {
+-		dev_err(qmp->dev, "failed to enable regulators, err=%d\n", ret);
+-		goto err_decrement_count;
+-	}
+-
+-	ret = reset_control_bulk_assert(cfg->num_resets, qmp->resets);
+-	if (ret) {
+-		dev_err(qmp->dev, "reset assert failed\n");
+-		goto err_disable_regulators;
+-	}
+-
+-	ret = reset_control_bulk_deassert(cfg->num_resets, qmp->resets);
+-	if (ret) {
+-		dev_err(qmp->dev, "reset deassert failed\n");
+-		goto err_disable_regulators;
+-	}
+-
+-	ret = clk_bulk_prepare_enable(qmp->num_clks, qmp->clks);
+-	if (ret)
+-		goto err_assert_reset;
+-
+-	/* In DP-only mode, the pipe clk is still required for USB2 */
+-	ret = clk_prepare_enable(qmp->pipe_clk);
+-	if (ret) {
+-		dev_err(qmp->dev, "pipe_clk enable failed err=%d\n", ret);
+-		goto err_disable_clocks;
+-	}
+-
+ 	qphy_setbits(com, QPHY_V3_DP_COM_POWER_DOWN_CTRL, SW_PWRDN);
+ 
+ 	/* override hardware control for reset of qmp phy */
+@@ -3723,6 +3698,86 @@
+ 	qphy_setbits(qmp->pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
+ 			SW_PWRDN);
+ 
++	qmp->com_powered = true;
++}
++
++/*
++ * Re-establish the shared COM block for a user that did not set it up.
++ * System sleep collapses the block's GDSC with CX and takes its register
++ * state with it, while init_count - and with it the regulators and the
++ * clocks the other user took - stays valid. Only the resets and the
++ * programming are replayed here: a full teardown + setup would gate the
++ * clocks and drop a DP link that is still alive after resume.
++ */
++static int qmp_combo_com_restore(struct qmp_combo *qmp)
++{
++	const struct qmp_phy_cfg *cfg = qmp->cfg;
++	int ret;
++
++	ret = reset_control_bulk_deassert(cfg->num_resets, qmp->resets);
++	if (ret) {
++		dev_err(qmp->dev, "reset deassert failed, err=%d\n", ret);
++		return ret;
++	}
++
++	qmp_combo_com_program(qmp);
++
++	return 0;
++}
++
++static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
++{
++	const struct qmp_phy_cfg *cfg = qmp->cfg;
++	int ret;
++
++	if (!force && qmp->init_count++) {
++		if (qmp->com_powered)
++			return 0;
++
++		/*
++		 * Another user (typically the DP sub-PHY) holds the
++		 * reference, but the block itself lost its register state
++		 * over system sleep: replay its setup instead of returning
++		 * early, or qmp_combo_usb_power_on() polls a dead PCS block
++		 * until it times out and takes the whole controller with it.
++		 */
++		ret = qmp_combo_com_restore(qmp);
++		if (ret)
++			qmp->init_count--;
++		return ret;
++	}
++
++	ret = regulator_bulk_enable(cfg->num_vregs, qmp->vregs);
++	if (ret) {
++		dev_err(qmp->dev, "failed to enable regulators, err=%d\n", ret);
++		goto err_decrement_count;
++	}
++
++	ret = reset_control_bulk_assert(cfg->num_resets, qmp->resets);
++	if (ret) {
++		dev_err(qmp->dev, "reset assert failed\n");
++		goto err_disable_regulators;
++	}
++
++	ret = reset_control_bulk_deassert(cfg->num_resets, qmp->resets);
++	if (ret) {
++		dev_err(qmp->dev, "reset deassert failed\n");
++		goto err_disable_regulators;
++	}
++
++	ret = clk_bulk_prepare_enable(qmp->num_clks, qmp->clks);
++	if (ret)
++		goto err_assert_reset;
++
++	/* In DP-only mode, the pipe clk is still required for USB2 */
++	ret = clk_prepare_enable(qmp->pipe_clk);
++	if (ret) {
++		dev_err(qmp->dev, "pipe_clk enable failed err=%d\n", ret);
++		goto err_disable_clocks;
++	}
++
++	qmp_combo_com_program(qmp);
++
+ 	return 0;
+ 
+ err_disable_clocks:
+@@ -3751,6 +3806,8 @@
+ 
+ 	regulator_bulk_disable(cfg->num_vregs, qmp->vregs);
+ 
++	qmp->com_powered = false;
++
+ 	return 0;
+ }
+ 
+@@ -3878,7 +3935,11 @@
+ 	ret = readl_poll_timeout(status, val, !(val & PHYSTATUS), 200,
+ 			PHY_INIT_COMPLETE_TIMEOUT);
+ 	if (ret) {
+-		dev_err(qmp->dev, "phy initialization timed-out\n");
++		dev_err(qmp->dev,
++			"phy initialization timed-out (mode=%d powered=%d)\n",
++			qmp->qmpphy_mode, qmp->com_powered);
++		dev_err(qmp->dev, "  qmp refs: usb_init=%u dp_init=%u\n",
++			qmp->usb_init_count, qmp->dp_init_count);
+ 		goto err_disable_pipe_clk;
+ 	}
+ 
+@@ -4051,6 +4112,8 @@
+ 	clk_disable_unprepare(qmp->pipe_clk);
+ 	clk_bulk_disable_unprepare(qmp->num_clks, qmp->clks);
+ 
++	qmp->com_powered = false;
++
+ 	return 0;
+ }
+ 
+@@ -4082,7 +4145,23 @@
+ 	return 0;
+ }
+ 
++/*
++ * The shared COM block does not keep its register state over system sleep -
++ * its USB3_PHY_GDSC collapses with CX - while init_count does. Mark it stale
++ * so the first user after resume (USB) replays the setup instead of assuming
++ * the block it left behind is still there.
++ */
++static int __maybe_unused qmp_combo_suspend(struct device *dev)
++{
++	struct qmp_combo *qmp = dev_get_drvdata(dev);
++
++	qmp->com_powered = false;
++
++	return 0;
++}
++
+ static const struct dev_pm_ops qmp_combo_pm_ops = {
++	.suspend = qmp_combo_suspend,
+ 	SET_RUNTIME_PM_OPS(qmp_combo_runtime_suspend,
+ 			   qmp_combo_runtime_resume, NULL)
+ };
