@@ -1,0 +1,32 @@
+# ADSP images bundled into the initramfs, globs relative to /usr/lib/firmware.
+# USB-C boot needs the ADSP up before the rootfs is mounted (see
+# 91armada-adsp): without VBUS sourcing no stick and no keyboard is visible to
+# the kernel, and dracut hangs in initqueue.
+#
+# Which image actually loads is decided per board by the kernel itself: every
+# board DT carries its own firmware-name and request_firmware() resolves it.
+# The globs below just say "bundle every board's ADSP image", so one generic
+# image boots any board whose firmware the repo vendors.
+#
+# An ADSP image is ~28 MB raw but the initramfs is compressed, so the whole
+# set costs far less in the image. A glob matching nothing fails the build.
+#
+# Not covered: sm8250 boards (thorlite, retroidpocket-common, mangmi, ayaneo
+# pocket micro2) reference qcom/sm8250/adsp.mbn, which the repo does not
+# vendor; they cannot USB-boot until it is added.
+
+# sm8550, sm8650, sm8750: single ELF image + board DTB, two levels deep
+# (ayn/odin2, retroidpocket/rp6, ayaneo/ps2, konkr/pfe, ...).
+qcom/sm8550/*/*/adsp.mbn
+qcom/sm8550/*/*/adsp_dtb.mbn
+qcom/sm8650/*/*/adsp.mbn
+qcom/sm8650/*/*/adsp_dtb.mbn
+qcom/sm8750/*/*/adsp.mbn
+qcom/sm8750/*/*/adsp_dtb.mbn
+
+# sm8550 Ayaneo Pocket: MDT metadata plus split .bNN segments, each requested
+# individually by the loader (one level deep under sm8550).
+qcom/sm8550/*/adsp.mdt
+qcom/sm8550/*/adsp.b*
+qcom/sm8550/*/adsp_dtb.mdt
+qcom/sm8550/*/adsp_dtb.b*
